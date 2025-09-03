@@ -9,7 +9,7 @@
 #include "mla.h"
 
 
-#define PRINT_DBG 0
+#define PRINT_DBG 1
 
 // ===================================================================================================================
 // MLA Metadata V0
@@ -370,6 +370,8 @@ struct MlaMetadataV1KernelParameter
     int32_t        reduce_indptr_size;
     int32_t        kv_granularity;
     bool           is_causal;
+
+    const int32_t* p_test_params;
 };
 
 // This version just follows Flashinfer
@@ -709,8 +711,12 @@ __global__ void kn_get_mla_metadata_v1(
     const int32_t workload_var = workload_square_sum / params.num_batches - workload_avg * workload_avg;
 
     const int32_t workload_limit_global =
-        cal_workload_limit_global_v2(
+    [&]() {
+        if (params.p_test_params[0] > 0)
+            return ck_tile::integer_least_multiple(params.p_test_params[0], params.kv_granularity);
+        return cal_workload_limit_global_v2(
             num_clusters, params.num_batches, workload_avg, workload_var, params.kv_granularity);
+    }();
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -907,7 +913,8 @@ void get_mla_metadata_v1_device(
     torch::Tensor&       work_indptr,
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
-    torch::Tensor&       reduce_partial_map)
+    torch::Tensor&       reduce_partial_map,
+    torch::Tensor&       test_params)
 {
     TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
@@ -985,6 +992,8 @@ void get_mla_metadata_v1_device(
     params.reduce_indptr_size   = reduce_indptr.size(0);
     params.kv_granularity       = kv_granularity;
     params.is_causal            = is_causal;
+
+    params.p_test_params        = test_params.data_ptr<int32_t>();
 
     // launch kernel
     const dim3 grid = dim3(1, 1, 1);
@@ -1285,7 +1294,8 @@ void get_mla_metadata_v1(
     torch::Tensor&       work_indptr,
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
-    torch::Tensor&       reduce_partial_map)
+    torch::Tensor&       reduce_partial_map,
+    torch::Tensor&       test_params)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
 
@@ -1308,7 +1318,8 @@ void get_mla_metadata_v1(
         work_indptr,
         reduce_indptr,
         reduce_final_map,
-        reduce_partial_map);
+        reduce_partial_map,
+        test_params);
 }
 
 std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(

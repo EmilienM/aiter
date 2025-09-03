@@ -233,6 +233,10 @@ def test_mla(
         [batch_size * cu_num], dtype=torch.int32, device="cuda"
     )
 
+    metadata_test_params = torch.tensor(
+        [-1, -1, -1, -1], dtype=torch.int32, device="cuda"
+    )
+
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -246,6 +250,7 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        metadata_test_params,
     )
 
     valid_work_cnt = 0
