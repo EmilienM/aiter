@@ -9,7 +9,8 @@
 #include "mla.h"
 
 
-#define PRINT_DBG 1
+#define PRINT_DBG 0
+#define OUTPUT_TEST 1
 
 // ===================================================================================================================
 // MLA Metadata V0
@@ -372,6 +373,8 @@ struct MlaMetadataV1KernelParameter
     bool           is_causal;
 
     const int32_t* p_test_params;
+    int32_t*       p_test_outputs;
+    int32_t        stride_test_outputs;
 };
 
 // This version just follows Flashinfer
@@ -493,7 +496,7 @@ CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v2(
 }
 
 template <typename Traits, bool kOnlyGatherWorkCount>
-CK_TILE_DEVICE void generate_work(
+CK_TILE_DEVICE int32_t generate_work(
     const int32_t       batch_idx,
     const int32_t       tile_idx,
     const int32_t       qo_len,
@@ -517,6 +520,7 @@ CK_TILE_DEVICE void generate_work(
 {
     int32_t remaining_kv_len = kv_len;
     int32_t kv_start_local = 0;
+    int32_t num_splits = 0;
 
     const int32_t kv_len_limit_floor =
         ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len, num_clusters), kv_granularity);
@@ -588,6 +592,7 @@ CK_TILE_DEVICE void generate_work(
             }
 
             ++p_cluster_work_counter[cid];
+            ++num_splits;
         }
 
         // Update state
@@ -595,6 +600,8 @@ CK_TILE_DEVICE void generate_work(
         kv_start_local += kv_len_consuming;
     }
     while (remaining_kv_len > 0);
+
+    return num_splits;
 }
 
 template <typename T>
@@ -633,6 +640,10 @@ __global__ void kn_get_mla_metadata_v1(
     extern __shared__ uint8_t p_smem[];
 
     const int32_t lane_idx = ck_tile::get_lane_id();
+
+    int32_t* p_test_metadata = params.p_test_outputs + 0 * params.stride_test_outputs;
+    int32_t* p_test_num_splits = params.p_test_outputs + 1 * params.stride_test_outputs;
+    int32_t* p_test_workloads = params.p_test_outputs + 2 * params.stride_test_outputs;
 
     // Step.0. Get sequence lengths of query/output and key/value for each batch.
     int32_t* p_batch_idx = reinterpret_cast<int32_t*>(p_smem);
@@ -717,6 +728,12 @@ __global__ void kn_get_mla_metadata_v1(
         return cal_workload_limit_global_v2(
             num_clusters, params.num_batches, workload_avg, workload_var, params.kv_granularity);
     }();
+#if OUTPUT_TEST
+    if (lane_idx == 0)
+    {
+        p_test_metadata[0] = workload_limit_global;
+    }
+#endif
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -758,10 +775,17 @@ __global__ void kn_get_mla_metadata_v1(
                 cal_packed_causal_kv_len(
                     qo_len, kv_len, tid, cluster_len_q, num_qo_tiles, params.num_heads, params.is_causal);
 
-            generate_work<Traits, true>(
+            const int32_t num_splits = generate_work<Traits, true>(
                 bid, tid, qo_len, tile_kv_len, cluster_len_q, qo_batch_start, kv_batch_start, kv_batch_end,
                 workload_limit_global, num_clusters, params.kv_granularity, nullptr, p_num_qo_clusters_indptr,
                 nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap, p_cluster_work_counter);
+
+#if OUTPUT_TEST
+            if (lane_idx==0)
+            {
+                p_test_num_splits[bid] = num_splits;
+            }
+#endif
         }
     }
 
@@ -887,6 +911,16 @@ __global__ void kn_get_mla_metadata_v1(
         params.p_work_metadata_ptrs[1] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(params.p_work_info_set_raw));
     }
 
+#if OUTPUT_TEST
+    if (lane_idx == 0)
+    {
+        for (int32_t cid = 0; cid < num_clusters; ++cid)
+        {
+            p_test_workloads[cid] = p_cost_heap[cid];
+        }
+    }
+#endif
+
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -914,7 +948,8 @@ void get_mla_metadata_v1_device(
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
     torch::Tensor&       reduce_partial_map,
-    torch::Tensor&       test_params)
+    torch::Tensor&       test_params,
+    torch::Tensor&       test_outputs)
 {
     TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
@@ -994,6 +1029,8 @@ void get_mla_metadata_v1_device(
     params.is_causal            = is_causal;
 
     params.p_test_params        = test_params.data_ptr<int32_t>();
+    params.p_test_outputs       = test_outputs.data_ptr<int32_t>();
+    params.stride_test_outputs  = test_outputs.stride(0);
 
     // launch kernel
     const dim3 grid = dim3(1, 1, 1);
@@ -1295,7 +1332,8 @@ void get_mla_metadata_v1(
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
     torch::Tensor&       reduce_partial_map,
-    torch::Tensor&       test_params)
+    torch::Tensor&       test_params,
+    torch::Tensor&       test_outputs)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
 
@@ -1319,7 +1357,8 @@ void get_mla_metadata_v1(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        test_params);
+        test_params,
+        test_outputs);
 }
 
 std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(

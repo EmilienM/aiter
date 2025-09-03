@@ -20,7 +20,7 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
 
 
-# setup_seed(1)
+setup_seed(1)
 
 
 def cal_diff(
@@ -233,8 +233,15 @@ def test_mla(
         [batch_size * cu_num], dtype=torch.int32, device="cuda"
     )
 
+    # [0]: fixed workload_limit_global. only valid when the fixed value is larger than 0.
     metadata_test_params = torch.tensor(
-        [-1, -1, -1, -1], dtype=torch.int32, device="cuda"
+        [240, -1, -1, -1], dtype=torch.int32, device="cuda"
+    )
+    # [0,0]: actual workload_limit_global
+    # [1]: #splits for each batch
+    # [2]: workload for each cu
+    metadata_test_outputs = torch.empty(
+        [3, max(1, batch_size, cu_num)], dtype=torch.int32, device="cuda"
     )
 
     meta = aiter.get_mla_metadata_v1(
@@ -251,6 +258,7 @@ def test_mla(
         reduce_final_map,
         reduce_partial_map,
         metadata_test_params,
+        metadata_test_outputs,
     )
 
     valid_work_cnt = 0
@@ -281,12 +289,17 @@ def test_mla(
     print(reduce_final_map[:batch_size])
     print(f"reduce_partial_map({reduce_partial_map.shape}.{valid_reduce_partial_cnt}):")
     print(reduce_partial_map[:valid_reduce_partial_cnt])
+    print("metadata_test_outputs[1] - #splits for each batch:")
+    print(metadata_test_outputs[1][:batch_size])
+    print("metadata_test_outputs[2] - workload for each cu:")
+    print(metadata_test_outputs[2][:cu_num])
+    print(f"workload_limit_global: {metadata_test_outputs[0][0].item()}")
 
     def test_absorb_decode():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (attn_logits, attn_lse), us_asm_decode, avg_prof = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
             kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -305,6 +318,14 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
         )
 
+        avg_time_main = 0.0
+        avg_time_reduce = 0.0
+        for el in avg_prof:
+            if "aiter::mla_" in el.key:
+                avg_time_main = el.device_time
+            elif "kn_mla_reduce_v1" in el.key:
+                avg_time_reduce = el.device_time
+
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
         # checkAllclose(logits_ref, attn_logits,
@@ -320,11 +341,11 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        return err, us_asm_decode
+        return err, us_asm_decode, avg_time_main, avg_time_reduce
 
     err = None
     us_asm_decode = 10000000000
-    err, us_asm_decode = test_absorb_decode()
+    err, us_asm_decode, avg_time_bf16_main, avg_time_bf16_reduce = test_absorb_decode()
 
     def test_absorb_decode_fp8():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -351,7 +372,7 @@ def test_mla(
             kv_scale=kv_scale,
         )
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (attn_logits, attn_lse), us_asm_decode, avg_prof = run_perftest(
             aiter.mla.mla_decode_fwd,
             q_fp8,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -371,6 +392,14 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
         )
+
+        avg_time_main = 0.0
+        avg_time_reduce = 0.0
+        for el in avg_prof:
+            if "aiter::mla_" in el.key:
+                avg_time_main = el.device_time
+            elif "kn_mla_reduce_v1" in el.key:
+                avg_time_reduce = el.device_time
 
         cal_diff(out_ref, out_asm, "out", True)
 
@@ -395,9 +424,22 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        return err, err_fp8, us_asm_decode
+        return err, err_fp8, us_asm_decode, avg_time_main, avg_time_reduce
 
-    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_decode_fp8()
+    (
+        err_fp8_fp32,
+        err_fp8_fp8,
+        us_asm_decode_fp8,
+        avg_time_fp8_main,
+        avg_time_fp8_reduce,
+    ) = test_absorb_decode_fp8()
+
+    print(
+        f"[RJM] bf16 = {avg_time_bf16_main} + {avg_time_bf16_reduce} = {avg_time_bf16_main + avg_time_bf16_reduce}"
+    )
+    print(
+        f"[RJM] fp8 = {avg_time_fp8_main} + {avg_time_fp8_reduce} = {avg_time_fp8_main + avg_time_fp8_reduce}"
+    )
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")

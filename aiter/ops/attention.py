@@ -311,6 +311,7 @@ def get_mla_metadata_v1(
     reduce_final_map: torch.Tensor,
     reduce_partial_map: torch.Tensor,
     test_params: torch.Tensor,
+    test_outputs: torch.Tensor,
 ):
     """
     Inputs:
