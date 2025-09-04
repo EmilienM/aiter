@@ -8,6 +8,7 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
+import math
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False, threshold=torch.inf)
@@ -21,6 +22,65 @@ def setup_seed(seed):
 
 
 setup_seed(1)
+
+
+class YamlRecorder:
+    def __init__(self):
+        self.yaml_db = []
+        self.bf16_curr = {}
+        self.fp8_curr = {}
+
+    def update_curr(
+        self,
+        type,
+        seq_lens_kv,
+        num_splits,
+        workloads,
+        workload_limit_global,
+        default_workload_limit_global,
+        avg_time_main,
+        avg_time_reduce,
+    ):
+        curr = None
+        if type == "bf16":
+            curr = self.bf16_curr
+        elif type == "fp8":
+            curr = self.fp8_curr
+        assert curr != None
+
+        if curr and num_splits == curr["num_splits"]:
+            curr["workload_limit_global"][0] = min(
+                curr["workload_limit_global"][0], workload_limit_global
+            )
+            curr["workload_limit_global"][1] = max(
+                curr["workload_limit_global"][1], workload_limit_global
+            )
+            curr["avg_time_main"] = min(curr["avg_time_main"], avg_time_main)
+            curr["avg_time_reduce"] = min(curr["avg_time_reduce"], avg_time_reduce)
+        elif not curr or (
+            (curr["avg_time_main"] + curr["avg_time_reduce"])
+            < (avg_time_main + avg_time_reduce)
+        ):
+            curr["type"] = type
+            curr["seq_lens_kv"] = seq_lens_kv
+            curr["num_splits"] = num_splits
+            curr["workloads"] = workloads
+            curr["workload_limit_global"] = [
+                workload_limit_global,
+                workload_limit_global,
+            ]
+            curr["default_workload_limit_global"] = default_workload_limit_global
+            curr["avg_time_main"] = avg_time_main
+            curr["avg_time_reduce"] = avg_time_reduce
+
+    def update_yaml(self):
+        self.yaml_db.append(self.bf16_curr)
+        self.yaml_db.append(self.fp8_curr)
+        self.bf16_curr = {}
+        self.fp8_curr = {}
+
+
+yaml_db = YamlRecorder()
 
 
 def cal_diff(
@@ -136,6 +196,7 @@ def torch_mla_extend(
 @benchmark()
 def test_mla(
     ctx_lens,
+    ctx_lens_lb,
     batch_size,
     nhead,
     kv_lora_rank,
@@ -161,7 +222,7 @@ def test_mla(
     if varlen:
         for i in range(batch_size):
             # seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
-            seq_lens_kv[i] = random.uniform(5, ctx_lens)
+            seq_lens_kv[i] = random.uniform(ctx_lens_lb, ctx_lens)
             seq_lens_qo[i] = max(
                 min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
             )
@@ -202,20 +263,6 @@ def test_mla(
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=dtype)
 
-    # troch implementation
-    out_ref, lse_ref = torch_mla_extend(
-        q,
-        kv_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        sm_scale,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        is_causal=True,
-        dtype=dtype,
-    )
-
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
@@ -235,7 +282,7 @@ def test_mla(
 
     # [0]: fixed workload_limit_global. only valid when the fixed value is larger than 0.
     metadata_test_params = torch.tensor(
-        [240, -1, -1, -1], dtype=torch.int32, device="cuda"
+        [-1, -1, -1, -1], dtype=torch.int32, device="cuda"
     )
     # [0,0]: actual workload_limit_global
     # [1]: #splits for each batch
@@ -261,41 +308,64 @@ def test_mla(
         metadata_test_outputs,
     )
 
-    valid_work_cnt = 0
-    for i in range(batch_size * 80):
-        bid = work_info_set[i][0].item()
-        if bid >= batch_size or bid < 0:
-            break
-        valid_work_cnt = i + 1
-    valid_reduce_partial_cnt = 0
-    for i in range(batch_size * 80):
-        idx = reduce_partial_map[i].item()
-        if idx >= 80 * qo_indptr[-1].item() * nhead or idx < 0:
-            break
-        valid_reduce_partial_cnt = i + 1
-        if idx == reduce_partial_map[-1].item():
-            break
-    print(f"seq_lens_kv({seq_lens_kv.shape}):")
-    print(seq_lens_kv)
-    print(f"kv_indptr({kv_indptr.shape}):")
-    print(kv_indptr)
-    print(f"work_indptr({work_indptr.shape}):")
-    print(work_indptr)
-    print(f"work_info_set({work_info_set.shape}.{valid_work_cnt}):")
-    print(work_info_set[:valid_work_cnt])
-    print(f"reduce_indptr({batch_size + 1}):")
-    print(reduce_indptr[: batch_size + 1])
-    print(f"reduce_final_map({batch_size}):")
-    print(reduce_final_map[:batch_size])
-    print(f"reduce_partial_map({reduce_partial_map.shape}.{valid_reduce_partial_cnt}):")
-    print(reduce_partial_map[:valid_reduce_partial_cnt])
-    print("metadata_test_outputs[1] - #splits for each batch:")
-    print(metadata_test_outputs[1][:batch_size])
-    print("metadata_test_outputs[2] - workload for each cu:")
-    print(metadata_test_outputs[2][:cu_num])
-    print(f"workload_limit_global: {metadata_test_outputs[0][0].item()}")
+    # valid_work_cnt = 0
+    # for i in range(batch_size * 80):
+    #     bid = work_info_set[i][0].item()
+    #     if bid >= batch_size or bid < 0:
+    #         break
+    #     valid_work_cnt = i + 1
+    # valid_reduce_partial_cnt = 0
+    # for i in range(batch_size * 80):
+    #     idx = reduce_partial_map[i].item()
+    #     if idx >= 80 * qo_indptr[-1].item() * nhead or idx < 0:
+    #         break
+    #     valid_reduce_partial_cnt = i + 1
+    #     if idx == reduce_partial_map[-1].item():
+    #         break
+    # print(f"seq_lens_kv({seq_lens_kv.shape}):")
+    # print(seq_lens_kv)
+    # print(f"kv_indptr({kv_indptr.shape}):")
+    # print(kv_indptr)
+    # print(f"work_indptr({work_indptr.shape}):")
+    # print(work_indptr)
+    # print(f"work_info_set({work_info_set.shape}.{valid_work_cnt}):")
+    # print(work_info_set[:valid_work_cnt])
+    # print(f"reduce_indptr({batch_size + 1}):")
+    # print(reduce_indptr[: batch_size + 1])
+    # print(f"reduce_final_map({batch_size}):")
+    # print(reduce_final_map[:batch_size])
+    # print(f"reduce_partial_map({reduce_partial_map.shape}.{valid_reduce_partial_cnt}):")
+    # print(reduce_partial_map[:valid_reduce_partial_cnt])
+    # print("metadata_test_outputs[1] - #splits for each batch:")
+    # print(metadata_test_outputs[1][:batch_size])
+    # print("metadata_test_outputs[2] - workload for each cu:")
+    # print(metadata_test_outputs[2][:cu_num])
+    # print(f"workload_limit_global: {metadata_test_outputs[0][0].item()}")
 
-    def test_absorb_decode():
+    default_workload_limit_global = metadata_test_outputs[0][0].item()
+    workload_limit_global_min = max(
+        int(math.ceil(default_workload_limit_global / 4 / 16) * 16), 16
+    )
+    workload_limit_global_max = int(
+        math.ceil(default_workload_limit_global * 2 / 16) * 16
+    )
+
+    def test_absorb_decode(check_quality):
+        # troch implementation
+        if check_quality:
+            out_ref, lse_ref = torch_mla_extend(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                sm_scale,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                is_causal=True,
+                dtype=dtype,
+            )
+
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
@@ -336,18 +406,22 @@ def test_mla(
             total_kv * nhead_kv * qk_head_dim
             + total_q * nhead * (qk_head_dim + v_head_dim)
         ) * (torch.finfo(dtype).bits // 8)
-        err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
+        err = True
+        if check_quality:
+            err = checkAllclose(
+                out_ref,
+                out_asm,
+                msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+            )
         return err, us_asm_decode, avg_time_main, avg_time_reduce
 
     err = None
     us_asm_decode = 10000000000
-    err, us_asm_decode, avg_time_bf16_main, avg_time_bf16_reduce = test_absorb_decode()
+    err, us_asm_decode, avg_time_bf16_main, avg_time_bf16_reduce = test_absorb_decode(
+        False
+    )
 
-    def test_absorb_decode_fp8():
+    def test_absorb_decode_fp8(check_quality):
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
@@ -357,20 +431,21 @@ def test_mla(
         kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
-            q_fp8,
-            kv_buffer_fp8,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            sm_scale,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            dtype=dtype,
-            is_causal=True,
-            q_scale=q_scale,
-            kv_scale=kv_scale,
-        )
+        if check_quality:
+            out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
+                q_fp8,
+                kv_buffer_fp8,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                sm_scale,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                dtype=dtype,
+                is_causal=True,
+                q_scale=q_scale,
+                kv_scale=kv_scale,
+            )
 
         (attn_logits, attn_lse), us_asm_decode, avg_prof = run_perftest(
             aiter.mla.mla_decode_fwd,
@@ -401,7 +476,8 @@ def test_mla(
             elif "kn_mla_reduce_v1" in el.key:
                 avg_time_reduce = el.device_time
 
-        cal_diff(out_ref, out_asm, "out", True)
+        if check_quality:
+            cal_diff(out_ref, out_asm, "out", True)
 
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
@@ -413,33 +489,90 @@ def test_mla(
             total_kv * nhead_kv * qk_head_dim
             + total_q * nhead * (qk_head_dim + v_head_dim)
         ) * (torch.finfo(dtype).bits // 8)
+
+        err = True
         # err = checkAllclose(
         #     out_ref,
         #     out_asm,
         #     msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         # )
-        err = True
-        err_fp8 = checkAllclose(
-            out_ref_fp8,
-            out_asm,
-            msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
+        err_fp8 = True
+        if check_quality:
+            err_fp8 = checkAllclose(
+                out_ref_fp8,
+                out_asm,
+                msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+            )
         return err, err_fp8, us_asm_decode, avg_time_main, avg_time_reduce
 
+    err, us_asm_decode, avg_time_bf16_main, avg_time_bf16_reduce = test_absorb_decode(
+        False
+    )
     (
         err_fp8_fp32,
         err_fp8_fp8,
         us_asm_decode_fp8,
         avg_time_fp8_main,
         avg_time_fp8_reduce,
-    ) = test_absorb_decode_fp8()
+    ) = test_absorb_decode_fp8(False)
 
-    print(
-        f"[RJM] bf16 = {avg_time_bf16_main} + {avg_time_bf16_reduce} = {avg_time_bf16_main + avg_time_bf16_reduce}"
-    )
-    print(
-        f"[RJM] fp8 = {avg_time_fp8_main} + {avg_time_fp8_reduce} = {avg_time_fp8_main + avg_time_fp8_reduce}"
-    )
+    for test_workload_limit_global in range(
+        workload_limit_global_min, workload_limit_global_max, 16
+    ):
+        metadata_test_params[0] = test_workload_limit_global
+        meta = aiter.get_mla_metadata_v1(
+            qo_indptr,
+            kv_indptr,
+            nhead // nhead_kv,
+            nhead_kv,
+            True,
+            max(page_size, 16),
+            work_meta_data,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            metadata_test_params,
+            metadata_test_outputs,
+        )
+
+        (
+            err_fp8_fp32,
+            err_fp8_fp8,
+            us_asm_decode_fp8,
+            avg_time_fp8_main,
+            avg_time_fp8_reduce,
+        ) = test_absorb_decode_fp8(False)
+
+        yaml_db.update_curr(
+            "bf16",
+            seq_lens_kv.tolist(),
+            metadata_test_outputs[1][:batch_size].tolist(),
+            metadata_test_outputs[2][:cu_num].tolist(),
+            metadata_test_outputs[0][0].item(),
+            [
+                default_workload_limit_global,
+                workload_limit_global_min,
+                workload_limit_global_max,
+            ],
+            avg_time_bf16_main,
+            avg_time_bf16_reduce,
+        )
+        yaml_db.update_curr(
+            "fp8",
+            seq_lens_kv.tolist(),
+            metadata_test_outputs[1][:batch_size].tolist(),
+            metadata_test_outputs[2][:cu_num].tolist(),
+            metadata_test_outputs[0][0].item(),
+            [
+                default_workload_limit_global,
+                workload_limit_global_min,
+                workload_limit_global_max,
+            ],
+            avg_time_fp8_main,
+            avg_time_fp8_reduce,
+        )
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")
@@ -544,8 +677,8 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    # default=[28, 512, 1023, 4888, 12800],  #
-    default=[512],
+    default=[28, 512, 1023, 4888, 12800],  #
+    # default=[512],
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -554,8 +687,8 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    # default=[i for i in range(1, 80)],  # [41],
-    default=[12],
+    default=[i for i in range(1, 80)],  # [41],
+    # default=[12],
     help="""Batch size.
     e.g.: -b 16""",
 )
@@ -580,11 +713,29 @@ if args.nhead is not None:
 
 for nhead, mtp in list_nhead:
     df = []
-    for dtype, kvtype, ctx_len, batch_size in itertools.product(
-        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize
+    for dtype, kvtype, ctx_len, ctx_len_lb_idx, batch_size in itertools.product(
+        list_dtype, l_kv_dtype, args.ctxLen, range(5), args.batchSize
     ):
+
+        def get_ctx_lens_lower_bound(idx, upper_bound) -> int:
+            if idx == 0:
+                return 5
+            elif idx == 1:
+                return int(upper_bound / 4)
+            elif idx == 2:
+                return int(upper_bound / 2)
+            elif idx == 3:
+                return int(upper_bound * 3 / 4)
+            elif idx == 4:
+                return upper_bound
+            else:
+                assert False
+
+        ctx_len_lb = get_ctx_lens_lower_bound(ctx_len_lb_idx, ctx_len)
+
         ret = test_mla(
             ctx_len,
+            ctx_len_lb,
             batch_size,
             nhead,
             args.kv_lora_rank,
@@ -598,6 +749,12 @@ for nhead, mtp in list_nhead:
             mtp=mtp,
         )
         df.append(ret)
+        yaml_db.update_yaml()
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
     aiter.logger.info(f"summary:\n{df}")
+
+import yaml
+
+with open("metadata_auto_tune_results.yaml", "w") as outfile:
+    yaml.dump(yaml_db.yaml_db, outfile, default_flow_style=None)
