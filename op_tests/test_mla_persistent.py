@@ -517,6 +517,8 @@ def test_mla(
         avg_time_fp8_reduce,
     ) = test_absorb_decode_fp8(False)
 
+    last_num_splits = None
+
     for test_workload_limit_global in range(
         workload_limit_global_min, workload_limit_global_max, 16
     ):
@@ -538,6 +540,13 @@ def test_mla(
             metadata_test_outputs,
         )
 
+        num_splits = metadata_test_outputs[1][:batch_size].tolist()
+        workloads = metadata_test_outputs[2][:cu_num].tolist()
+        workload_limit_global = metadata_test_outputs[0][0].item()
+
+        if last_num_splits is not None and last_num_splits == num_splits:
+            continue
+
         (
             err_fp8_fp32,
             err_fp8_fp8,
@@ -549,9 +558,9 @@ def test_mla(
         yaml_db.update_curr(
             "bf16",
             seq_lens_kv.tolist(),
-            metadata_test_outputs[1][:batch_size].tolist(),
-            metadata_test_outputs[2][:cu_num].tolist(),
-            metadata_test_outputs[0][0].item(),
+            num_splits,
+            workloads,
+            workload_limit_global,
             [
                 default_workload_limit_global,
                 workload_limit_global_min,
@@ -563,9 +572,9 @@ def test_mla(
         yaml_db.update_curr(
             "fp8",
             seq_lens_kv.tolist(),
-            metadata_test_outputs[1][:batch_size].tolist(),
-            metadata_test_outputs[2][:cu_num].tolist(),
-            metadata_test_outputs[0][0].item(),
+            num_splits,
+            workloads,
+            workload_limit_global,
             [
                 default_workload_limit_global,
                 workload_limit_global_min,
@@ -688,7 +697,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(1, 160, 3)],  # [41],
+    default=[i for i in range(1, 320, 1)],  # [41],
     # default=[12],
     help="""Batch size.
     e.g.: -b 16""",
