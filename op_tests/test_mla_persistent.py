@@ -343,11 +343,12 @@ def test_mla(
     # print(f"workload_limit_global: {metadata_test_outputs[0][0].item()}")
 
     default_workload_limit_global = metadata_test_outputs[0][0].item()
-    workload_limit_global_min = max(
+    workload_limit_global_min__ = max(
         int(math.ceil(default_workload_limit_global / 4 / 16) * 16), 16
     )
+    workload_limit_global_min = min(workload_limit_global_min__, 32)
     workload_limit_global_max = int(
-        math.ceil(default_workload_limit_global * 2 / 16) * 16
+        math.ceil(default_workload_limit_global * 1.5 / 16) * 16
     )
 
     def test_absorb_decode(check_quality):
@@ -687,7 +688,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(1, 80)],  # [41],
+    default=[i for i in range(1, 160, 3)],  # [41],
     # default=[12],
     help="""Batch size.
     e.g.: -b 16""",
